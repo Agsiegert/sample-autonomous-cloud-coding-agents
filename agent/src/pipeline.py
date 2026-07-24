@@ -18,6 +18,7 @@ from channel_mcp import configure_channel_mcp
 from config import (
     AGENT_WORKSPACE,
     build_config,
+    clear_jira_task_credentials,
     get_config,
     resolve_jira_oauth_token,
     resolve_linear_api_token,
@@ -640,6 +641,11 @@ def run_task(
 
     from repo import setup_repo
 
+    # AgentCore can reuse this process for another task. Scrub every Jira
+    # credential before config or repository code runs, including for non-Jira
+    # tasks, so a prior tenant's long-lived Forge secret cannot cross tasks.
+    clear_jira_task_credentials()
+
     # Build config
     config = build_config(
         repo_url=repo_url,
@@ -868,9 +874,9 @@ def run_task(
                 config.channel_metadata,
             )
 
-            # "Starting" comment on the Jira issue (REST shim — the Atlassian
-            # Remote MCP can't be used from a headless agent). No-op for
-            # non-Jira tasks. Best-effort; failures are logged, never block.
+            # "Starting" comment on the Jira issue through the Forge app actor
+            # (or legacy OAuth fallback). No-op for non-Jira tasks.
+            # Best-effort; failures are logged, never block.
             comment_task_started(
                 config.channel_source,
                 config.channel_metadata,
