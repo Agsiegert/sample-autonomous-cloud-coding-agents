@@ -422,22 +422,18 @@ export async function handler(event: ProcessorEvent): Promise<void> {
   }
 
   let orchestrationChildren: readonly SubIssueNode[] | undefined;
+  let existingOrchestration = false;
   if (ORCHESTRATION_TABLE && resolvedJira) {
-    // Layer #574 deliberately freezes an orchestration after its first seed.
-    // Additive re-discovery is introduced by #578; until then, a re-trigger is
-    // an idempotent no-op and must not create a parent task.
+    // Re-read an existing orchestration's authored graph so genuinely-new Jira
+    // subtasks can be appended. The flag also prevents parent attachments from
+    // being uploaded again below: the meta row already pins the first seed's S3
+    // versions, and replacing them would eventually expire those pinned objects.
     const existing = await loadOrchestration(
       ddb,
       ORCHESTRATION_TABLE,
       deriveOrchestrationId(issue.key),
     );
-    if (existing) {
-      logger.info('Jira orchestration already exists — skipping re-trigger', {
-        issue_key: issue.key,
-        orchestration_id: existing.meta.orchestration_id,
-      });
-      return;
-    }
+    existingOrchestration = existing !== null;
 
     const graphResult = await jiraGraphSource(
       resolvedJira.accessToken,
@@ -450,6 +446,12 @@ export async function handler(event: ProcessorEvent): Promise<void> {
         cloudId,
         `❌ ABCA couldn't read this issue's Jira subtasks: ${graphResult.message}`,
       );
+      return;
+    }
+    if (graphResult.kind === 'no_children' && existingOrchestration) {
+      logger.info('Jira orchestration re-trigger has no current subtasks — no-op', {
+        issue_key: issue.key,
+      });
       return;
     }
     if (graphResult.kind === 'ok') {
@@ -482,7 +484,7 @@ export async function handler(event: ProcessorEvent): Promise<void> {
   // fail-closed (a selected-but-unscreenable attachment rejects the task).
   let comments: RenderedComment[] = [];
   let preScreenedAttachments: PassedAttachmentRecord[] = [];
-  if (WORKSPACE_REGISTRY_TABLE) {
+  if (WORKSPACE_REGISTRY_TABLE && !existingOrchestration) {
     const tenantCtx = { cloudId, registryTableName: WORKSPACE_REGISTRY_TABLE };
 
     // Recent human comments — advisory context, never gate task creation.
@@ -581,9 +583,9 @@ export async function handler(event: ProcessorEvent): Promise<void> {
     }
 
     // A concurrent replay can win between the preflight read and the seed
-    // condition. Do not create a parent task or retain duplicate attachments.
-    if (discovery.kind === 'extended'
-      || (discovery.kind === 'seeded' && discovery.alreadyExisted)) {
+    // condition. The shared discovery path returns that race as an empty extend;
+    // any attachment objects uploaded by this invocation are duplicates.
+    if (discovery.kind === 'seeded' && discovery.alreadyExisted) {
       if (preScreenedAttachments.length > 0 && s3Client && ATTACHMENTS_BUCKET) {
         await cleanupPreScreenedAttachments(s3Client, ATTACHMENTS_BUCKET, preScreenedAttachments);
       }
@@ -665,6 +667,98 @@ export async function handler(event: ProcessorEvent): Promise<void> {
         issue_key: issue.key,
         orchestration_id: discovery.orchestrationId,
         child_count: discovery.childCount,
+      });
+      return;
+    }
+    if (discovery.kind === 'extended') {
+      if (discovery.addedSubIssueIds.length === 0) {
+        logger.info('Jira orchestration re-trigger added no new subtasks', {
+          issue_key: issue.key,
+          orchestration_id: discovery.orchestrationId,
+        });
+        return;
+      }
+
+      const snapshot = await loadOrchestration(ddb, ORCHESTRATION_TABLE, discovery.orchestrationId);
+      if (snapshot) {
+        const releasableRows = snapshot.children.filter(
+          (child) => discovery.releasableSubIssueIds.includes(child.sub_issue_id)
+            && child.child_status === 'ready',
+        );
+        let panelSnapshot = snapshot;
+        if (releasableRows.length > 0) {
+          const now = new Date().toISOString();
+          const results = await releaseReadyChildren(
+            ddb,
+            ORCHESTRATION_TABLE,
+            releasableRows,
+            snapshot.meta.release_context,
+            createTaskCore,
+            now,
+            snapshot.children,
+          );
+          await applyTerminalCreateFailures(
+            ddb,
+            ORCHESTRATION_TABLE,
+            discovery.orchestrationId,
+            snapshot.children,
+            results,
+            now,
+          );
+          panelSnapshot = await loadOrchestration(
+            ddb,
+            ORCHESTRATION_TABLE,
+            discovery.orchestrationId,
+          ) ?? snapshot;
+        }
+
+        if (WORKSPACE_REGISTRY_TABLE) {
+          try {
+            // Unlike seed, extension already has a durable snapshot. Refresh the
+            // panel from it even if a post-release read is temporarily unavailable.
+            const commentId = await upsertEpicPanel({
+              channel: makeJiraChannel(WORKSPACE_REGISTRY_TABLE),
+              parent: {
+                issueId: issue.key,
+                credentialsRef: cloudId,
+                stateOverrides: {
+                  ...(panelSnapshot.meta.release_context.jira_status_on_start && {
+                    started: panelSnapshot.meta.release_context.jira_status_on_start,
+                  }),
+                  ...(panelSnapshot.meta.release_context.jira_status_on_pr && {
+                    inReview: panelSnapshot.meta.release_context.jira_status_on_pr,
+                  }),
+                },
+              },
+              ...(panelSnapshot.meta.status_comment_id && {
+                statusCommentId: panelSnapshot.meta.status_comment_id,
+              }),
+              children: panelSnapshot.children,
+              inProgress: true,
+              labelFilter,
+            });
+            if (commentId && !panelSnapshot.meta.status_comment_id) {
+              await setStatusCommentId(
+                ddb,
+                ORCHESTRATION_TABLE,
+                discovery.orchestrationId,
+                commentId,
+              );
+            }
+          } catch (err) {
+            logger.warn('Failed to refresh Jira orchestration panel on extend (non-fatal)', {
+              issue_key: issue.key,
+              orchestration_id: discovery.orchestrationId,
+              error: err instanceof Error ? err.message : String(err),
+            });
+          }
+        }
+      }
+      logger.info('Jira orchestration extended with new subtasks', {
+        issue_key: issue.key,
+        orchestration_id: discovery.orchestrationId,
+        added_count: discovery.addedSubIssueIds.length,
+        releasable_count: discovery.releasableSubIssueIds.length,
       });
       return;
     }
