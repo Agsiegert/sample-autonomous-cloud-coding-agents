@@ -57,6 +57,8 @@ import { OperationalAlerts } from '../constructs/operational-alerts';
 import { OrchestrationReconciler } from '../constructs/orchestration-reconciler';
 import { OrchestrationTable } from '../constructs/orchestration-table';
 import { PendingUploadCleanup } from '../constructs/pending-upload-cleanup';
+import { AgentRegistryStack } from '../constructs/registry';
+import { RegistryApi } from '../constructs/registry-api';
 import { RepoTable } from '../constructs/repo-table';
 import { SlackIntegration } from '../constructs/slack-integration';
 import { buildAppId } from '../constructs/solution-ua-aspect';
@@ -123,6 +125,20 @@ export class AgentStack extends Stack {
     const webhookTable = new WebhookTable(this, 'WebhookTable');
     const apiKeyTable = new ApiKeyTable(this, 'ApiKeyTable');
     const repoTable = new RepoTable(this, 'RepoTable');
+
+    // AgentCore-backed asset registry (#246). Provisioned via a custom resource
+    // because CreateRegistry is async and has no CDK L2 during preview.
+    // GA-throwaway — swap for the native construct at GA. Registry names allow
+    // only alphanumerics + underscores, so sanitize the stack name.
+    //
+    // Isolated in a NestedStack: the registry + its Provider framework add ~20
+    // resources; nesting keeps the root stack under CloudFormation's hard
+    // 500-resource limit. registryId/registryArn cross the boundary via CDK's
+    // automatic cross-stack export/import.
+    const agentRegistry = new AgentRegistryStack(this, 'AgentRegistryStack', {
+      registryName: `abca_${this.stackName.replace(/[^a-zA-Z0-9]/g, '_')}`,
+      description: 'ABCA agent asset registry (#246)',
+    });
 
     // Cedar-wasm Lambda layer (§15.2 task 10). Instantiated here so the
     // asset is in the synthed template; Chunk 5 handlers (Approve,
@@ -378,6 +394,16 @@ export class AgentStack extends Stack {
       // immediately. Omitted when no image is configured — there can be no
       // MicroVM-backed task to cancel then.
       ...(microvmImageConfigured && { lambdaMicrovmImageArn: lazyMicrovmImageArn }),
+    });
+
+    // Agent asset registry API (#246) in its own NestedStack + RestApi so its
+    // ~35 resources don't count against this root stack's 500-resource limit.
+    // It authorizes against the SHARED Cognito user pool, so a caller's JWT works
+    // on both APIs; the CLI targets its distinct URL (RegistryApiUrl output) for
+    // `registry` commands.
+    const registryApi = new RegistryApi(this, 'RegistryApi', {
+      agentRegistryId: agentRegistry.registryId,
+      userPool: taskApi.userPool,
     });
 
     // --- Tool-federation Gateway (ADR-019 P1, CONTEXT-GATED) ---
@@ -713,6 +739,16 @@ export class AgentStack extends Stack {
     new CfnOutput(this, 'GitHubTokenSecretArn', {
       value: githubTokenSecret.secretArn,
       description: 'ARN of the Secrets Manager secret for the GitHub token',
+    });
+
+    new CfnOutput(this, 'AgentRegistryId', {
+      value: agentRegistry.registryId,
+      description: 'ID of the AgentCore-backed agent asset registry (#246)',
+    });
+
+    new CfnOutput(this, 'AgentRegistryArn', {
+      value: agentRegistry.registryArn,
+      description: 'ARN of the AgentCore-backed agent asset registry (#246)',
     });
 
     new CfnOutput(this, 'TraceArtifactsBucketName', {
@@ -1690,6 +1726,11 @@ export class AgentStack extends Stack {
     new CfnOutput(this, 'ApiUrl', {
       value: taskApi.api.url,
       description: 'URL of the Task API',
+    });
+
+    new CfnOutput(this, 'RegistryApiUrl', {
+      value: registryApi.apiUrl,
+      description: 'URL of the agent asset registry API (#246) — the CLI targets this for `bgagent registry` commands',
     });
 
     new CfnOutput(this, 'UserPoolId', {
