@@ -1199,3 +1199,106 @@ describe('AgentStack solution attribution (#319): AWS_SDK_UA_APP_ID via stack-le
     }
   });
 });
+
+describe('AgentStack tool-gateway gate (ADR-019 P1)', () => {
+  test('default (no-gate) synth provisions NO Gateway — synth stays byte-unchanged', () => {
+    // The whole ToolGateway construct is context-gated; without the flag the
+    // template must contain zero Gateway/GatewayTarget resources so the default
+    // deploy is untouched and no new CFN type enters the bootstrap coverage set.
+    const app = new App();
+    const stack = new AgentStack(app, 'NoGatewayStack', {
+      env: { account: '123456789012', region: 'us-east-1' },
+    });
+    const template = Template.fromStack(stack);
+    template.resourceCountIs('AWS::BedrockAgentCore::Gateway', 0);
+    template.resourceCountIs('AWS::BedrockAgentCore::GatewayTarget', 0);
+  });
+
+  describe('with --context enableToolGateway=true', () => {
+    let template: Template;
+
+    beforeAll(() => {
+      const app = new App({ context: { enableToolGateway: true } });
+      const stack = new AgentStack(app, 'GatewayStack', {
+        env: { account: '123456789012', region: 'us-east-1' },
+      });
+      template = Template.fromStack(stack);
+    });
+
+    test('provisions exactly one AWS_IAM Gateway + one Lambda target', () => {
+      template.resourceCountIs('AWS::BedrockAgentCore::Gateway', 1);
+      template.hasResourceProperties('AWS::BedrockAgentCore::Gateway', {
+        AuthorizerType: 'AWS_IAM',
+      });
+      template.resourceCountIs('AWS::BedrockAgentCore::GatewayTarget', 1);
+    });
+
+    test('the AgentCore runtime carries ABCA_TOOL_GATEWAY_URL', () => {
+      template.hasResourceProperties('AWS::BedrockAgentCore::Runtime', {
+        EnvironmentVariables: Match.objectLike({
+          ABCA_TOOL_GATEWAY_URL: Match.anyValue(),
+        }),
+      });
+    });
+  });
+
+  describe('substrate parity: with BOTH --context enableToolGateway=true AND compute_type=ecs', () => {
+    // #641 requires the federated tool to work on BOTH substrates. The
+    // AgentCore-runtime wiring is asserted above; without these two the ECS
+    // task could ship with no gateway URL and no InvokeGateway grant — the tool
+    // silently absent on Fargate while looking present in the AgentCore path.
+    // This is the both-substrates acceptance bar the ADR-019 review called out.
+    let template: Template;
+
+    beforeAll(() => {
+      const app = new App({
+        context: { enableToolGateway: true, compute_type: 'ecs' },
+      });
+      const stack = new AgentStack(app, 'GatewayEcsStack', {
+        env: { account: '123456789012', region: 'us-east-1' },
+      });
+      template = Template.fromStack(stack);
+    });
+
+    test('every ECS task definition container carries ABCA_TOOL_GATEWAY_URL', () => {
+      // Both the build and planning task defs share the base container env, so
+      // each must carry the gateway URL — assert on all of them, not just one.
+      const taskDefs = Object.values(
+        template.findResources('AWS::ECS::TaskDefinition'),
+      );
+      expect(taskDefs.length).toBeGreaterThan(0);
+      for (const taskDef of taskDefs) {
+        const containers = taskDef.Properties?.ContainerDefinitions ?? [];
+        const withGatewayUrl = containers.filter(
+          (c: { Environment?: { Name: string }[] }) =>
+            (c.Environment ?? []).some((e) => e.Name === 'ABCA_TOOL_GATEWAY_URL'),
+        );
+        expect(withGatewayUrl.length).toBeGreaterThan(0);
+      }
+    });
+
+    test('the ECS task role is granted bedrock-agentcore:InvokeGateway', () => {
+      // Scope the assertion to the ECS TASK role. The AgentCore runtime role is
+      // granted the same InvokeGateway action in this very template, so an
+      // unscoped `hasResourceProperties` would stay green even if the ECS
+      // grant (ecs-agent-cluster.ts:554) were deleted — precisely the
+      // cross-substrate regression this test exists to catch. Pin the policy to
+      // the EcsAgentCluster TaskRole via its `Roles` attachment.
+      template.hasResourceProperties('AWS::IAM::Policy', {
+        PolicyDocument: Match.objectLike({
+          Statement: Match.arrayWith([
+            Match.objectLike({
+              Action: 'bedrock-agentcore:InvokeGateway',
+              Effect: 'Allow',
+            }),
+          ]),
+        }),
+        Roles: Match.arrayWith([
+          Match.objectLike({
+            Ref: Match.stringLikeRegexp('EcsAgentClusterTaskRole'),
+          }),
+        ]),
+      });
+    });
+  });
+});
