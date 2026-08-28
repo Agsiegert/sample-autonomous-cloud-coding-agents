@@ -140,7 +140,7 @@ export class GitHubProviderOps implements GitProviderOps {
       const body = await resp.json() as { data?: { repository?: { viewerPermission?: string | null } } };
       return body.data?.repository?.viewerPermission ?? undefined;
     } catch {
-      return undefined;
+      return undefined; // nosemgrep: ts-silent-success-masking -- caller treats undefined as "permission unknown" and falls through to the next preflight check
     }
   }
 }

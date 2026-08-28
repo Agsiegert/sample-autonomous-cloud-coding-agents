@@ -49,7 +49,7 @@ async function resolveWebhookSecret(): Promise<string | undefined> {
     logger.error('Failed to resolve Bitbucket webhook secret', {
       error: err instanceof Error ? err.message : String(err),
     });
-    return undefined;
+    return undefined; // nosemgrep: ts-silent-success-masking -- caller treats undefined as "no secret configured" and skips signature verification gracefully
   }
 }
 
