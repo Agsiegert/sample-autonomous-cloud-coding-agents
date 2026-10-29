@@ -18,6 +18,7 @@
  */
 
 import { GetCommand } from '@aws-sdk/lib-dynamodb';
+import type { ComputeBackend } from './compute-backend';
 import { logger } from './logger';
 import type { GitProviderType } from './types';
 import { makeDocClient } from './ua';
@@ -26,7 +27,7 @@ import { makeDocClient } from './ua';
  * Per-repository configuration written by the Blueprint CDK construct
  * and read at runtime by the task API gate and the orchestrator.
  */
-export type ComputeType = 'agentcore' | 'ecs' | 'lambda-microvm';
+export type ComputeType = ComputeBackend;
 
 export interface RepoConfig {
   readonly repo: string;
@@ -82,7 +83,7 @@ export interface RepoConfig {
  */
 export interface BlueprintConfig {
   readonly compute_type: ComputeType;
-  readonly runtime_arn: string;
+  readonly runtime_arn?: string;
   readonly model_id?: string;
   readonly max_turns?: number;
   readonly max_budget_usd?: number;
